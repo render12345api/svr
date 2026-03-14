@@ -1,0 +1,11 @@
+{
+  "name": "ddos-panel-50k",
+  "version": "2.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "fastify": "^4.28.0"
+  }
+}
