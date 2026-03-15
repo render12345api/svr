@@ -5,7 +5,7 @@ const { SocksProxyAgent } = require('socks-proxy-agent');
 const axios = require('axios');
 
 // ========== CONFIGURATION ==========
-const PROXY_LIST_URL = 'https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/ss_configs.txt';
+const PROXY_LIST_URL = 'https://raw.githubusercontent.com/render12345api/svr/main/ss_working.txt';
 const MAX_PROXIES = 8;
 const REQS_PER_BURST = 100;
 const BURST_INTERVAL = 10; // ms
